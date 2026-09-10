@@ -10,145 +10,200 @@ import base64
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ChatJoinRequestHandler, ContextTypes, MessageHandler, filters
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ChatJoinRequestHandler, ContextTypes, MessageHandler, filters
 
-# ============================================================
-# CONFIG
-# ============================================================
-# IMPORTANT:
-# Set these as environment variables on Render/Hostinger.
-# Do NOT put your real bot token inside this file.
+# Setup logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# =================== [ CONFIGURATION ] ===================
+# Secrets are read from Render Environment Variables.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+except ValueError:
+    ADMIN_ID = 0
+# =========================================================
 
+# =================== GITHUB CONFIG ===================
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_OWNER = os.getenv("GITHUB_OWNER")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_FILE = os.getenv("GITHUB_FILE", "members.json")
-
-DB_FILE = "janeman_pro.db"
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# =====================================================
 
 if not BOT_TOKEN or not ADMIN_ID:
-    print("ERROR: BOT_TOKEN aur ADMIN_ID environment variables set karo.")
+    print("\n❌ ERROR: BOT_TOKEN aur ADMIN_ID Render Environment Variables me set karo!\n")
     sys.exit(1)
 
+# IMPORTANT:
+# CACHED_MESSAGES = ORIGINAL request/join-request sequence.
+# START_MESSAGES = NEW /start sequence. They are intentionally separate.
 CACHED_MESSAGES = []
+START_MESSAGES = []
+APPROVAL_MESSAGE = None  # (chat_id, msg_id)
 
+DEFAULT_APPROVAL_TEXT = "VIP ME APPROVAL KLIYE NEECHE BUTTON PE TAP KARE 👇👇👇👇"
+DEFAULT_APPROVAL_BUTTON = "✅ APPROVE ME"
+GITHUB_SYNC_LOCK = threading.Lock()
 
-# ============================================================
-# WEB SERVER / RENDER COMPATIBILITY
-# ============================================================
+# --- WEB SERVER & ANTI-SLEEP ---
 class HealthCheckServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Bot is running.")
+        self.wfile.write(b"Bot is Running 24/7 Deeply Active on Render!")
 
     def log_message(self, format, *args):
         return
 
-
 def run_health_server():
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckServer)
-    logger.info("Health server started on port %s", port)
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckServer)
+    logging.info(f"🟢 Web Server started successfully on port {port}")
     server.serve_forever()
-
 
 def self_ping_loop():
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
-        return
-
+        render_url = f"http://localhost:{os.environ.get('PORT', 8080)}"
     while True:
         try:
             import time
-            time.sleep(30)
-            req = urllib.request.Request(
-                render_url,
-                headers={"User-Agent": "VIP-Hyper-Bot"}
-            )
-            urllib.request.urlopen(req, timeout=5)
+            time.sleep(15)
+            if "localhost" not in render_url:
+                req = urllib.request.Request(render_url, headers={'User-Agent': 'VIP-Hyper-Bot'})
+                urllib.request.urlopen(req, timeout=5)
         except Exception as e:
-            logger.debug("Ping: %s", e)
+            logging.error(f"⚠️ Ping Note: {e}")
 
-
-# ============================================================
-# DATABASE
-# ============================================================
-def db():
-    return sqlite3.connect(DB_FILE, timeout=30)
-
-
+# --- DB, GITHUB & SYNC HELPERS ---
 def init_db():
-    global CACHED_MESSAGES
-
-    conn = db()
+    global CACHED_MESSAGES, START_MESSAGES, APPROVAL_MESSAGE
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
 
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS settings "
-        "(key TEXT PRIMARY KEY, value TEXT)"
-    )
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS stats "
-        "(key TEXT PRIMARY KEY, count INTEGER)"
-    )
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS users "
-        "(user_id INTEGER PRIMARY KEY)"
-    )
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS messages_list "
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, msg_id TEXT)"
-    )
+    # ORIGINAL tables - kept intact.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, count INTEGER)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS messages_list (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, msg_id TEXT)''')
 
-    # New feature: mark which saved message is the final message.
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS flow_settings "
-        "(key TEXT PRIMARY KEY, value TEXT)"
-    )
-
-    # New feature: users who have reached the final message.
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS flow_users "
-        "(user_id INTEGER PRIMARY KEY, reached_final INTEGER DEFAULT 0)"
-    )
-
-    cursor.execute(
-        "INSERT OR IGNORE INTO settings VALUES ('auto_accept', 'OFF')"
-    )
-    cursor.execute(
-        "INSERT OR IGNORE INTO stats VALUES ('total_requests', 0)"
-    )
-    cursor.execute(
-        "INSERT OR IGNORE INTO stats VALUES ('accepted', 0)"
-    )
-    cursor.execute(
-        "INSERT OR IGNORE INTO flow_settings VALUES ('final_message_id', '')"
-    )
-
+    # NEW tables only for /start flow.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS start_messages_list (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, msg_id TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS start_flow_users (user_id INTEGER PRIMARY KEY, final_reached INTEGER DEFAULT 0)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS approval_message (id INTEGER PRIMARY KEY CHECK (id=1), chat_id TEXT, msg_id TEXT)''')
+    cursor.execute("INSERT OR IGNORE INTO settings VALUES ('auto_accept', 'OFF')")
+    cursor.execute("INSERT OR IGNORE INTO stats VALUES ('total_requests', 0)")
+    cursor.execute("INSERT OR IGNORE INTO stats VALUES ('accepted', 0)")
+    cursor.execute("INSERT OR IGNORE INTO settings VALUES ('start_final_id', '')")
+    cursor.execute("INSERT OR IGNORE INTO settings VALUES ('approval_button', ?)", (DEFAULT_APPROVAL_BUTTON,))
     conn.commit()
 
-    cursor.execute(
-        "SELECT chat_id, msg_id FROM messages_list ORDER BY id ASC"
-    )
+    # ORIGINAL request/join-request messages.
+    cursor.execute("SELECT chat_id, msg_id FROM messages_list ORDER BY id ASC")
     CACHED_MESSAGES = cursor.fetchall()
+
+    # NEW /start messages.
+    cursor.execute("SELECT chat_id, msg_id FROM start_messages_list ORDER BY id ASC")
+    START_MESSAGES = cursor.fetchall()
+    cursor.execute("SELECT chat_id, msg_id FROM approval_message WHERE id=1")
+    APPROVAL_MESSAGE = cursor.fetchone()
     conn.close()
 
 
+def _github_get_members():
+    if not all([GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO]):
+        return []
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return []
+        raw = base64.b64decode(r.json()["content"]).decode()
+        users = json.loads(raw)
+        return [int(uid) for uid in users]
+    except Exception as e:
+        logging.error(f"GitHub Load Error: {e}")
+        return []
+
+
+def sync_users_to_github():
+    """Merge local + GitHub member IDs and write the union back to members.json."""
+    if not all([GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO]):
+        logging.warning("GitHub sync skipped: GITHUB_TOKEN/OWNER/REPO missing")
+        return False
+
+    with GITHUB_SYNC_LOCK:
+        try:
+            remote_users = set(_github_get_members())
+            local_users = set(get_all_users())
+            users = sorted(remote_users | local_users)
+
+            url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+            headers = {
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+
+            current = requests.get(url, headers=headers, timeout=15)
+            sha = current.json().get("sha") if current.status_code == 200 else None
+
+            content = json.dumps(users, indent=2) + "\n"
+            content_encoded = base64.b64encode(content.encode()).decode()
+            data = {"message": "Update members.json", "content": content_encoded}
+            if sha:
+                data["sha"] = sha
+
+            response = requests.put(url, headers=headers, json=data, timeout=20)
+            if response.status_code in (200, 201):
+                logging.info(f"GitHub members.json synced successfully: {len(users)} members")
+                return True
+
+            logging.error(f"GitHub Sync Failed [{response.status_code}]: {response.text}")
+            return False
+        except Exception as e:
+            logging.error(f"GitHub Sync Error: {e}")
+            return False
+
+
+def load_users_from_github():
+    users = _github_get_members()
+    if not users:
+        return
+    try:
+        conn = sqlite3.connect("janeman_pro.db")
+        cursor = conn.cursor()
+        for uid in users:
+            cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (uid,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"GitHub Load DB Error: {e}")
+
+
+def add_user(user_id):
+    conn = sqlite3.connect("janeman_pro.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+    sync_users_to_github()
+
+
+def get_all_users():
+    conn = sqlite3.connect('janeman_pro.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return users
+
+# --- DB HELPERS ---
 def get_setting(key):
-    conn = db()
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
     res = cursor.fetchone()
@@ -157,456 +212,143 @@ def get_setting(key):
 
 
 def set_setting(key, value):
-    conn = db()
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO settings VALUES (?, ?)",
-        (key, value)
-    )
+    cursor.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
     conn.commit()
     conn.close()
 
-
-def get_flow_setting(key):
-    conn = db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM flow_settings WHERE key=?", (key,))
-    res = cursor.fetchone()
-    conn.close()
-    return res[0] if res else ""
-
-
-def set_flow_setting(key, value):
-    conn = db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO flow_settings VALUES (?, ?)",
-        (key, str(value))
-    )
-    conn.commit()
-    conn.close()
-
-
-def mark_user_reached_final(user_id):
-    conn = db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO flow_users(user_id, reached_final) VALUES (?, 1)",
-        (user_id,)
-    )
-    conn.commit()
-    conn.close()
-
-
-def user_reached_final(user_id):
-    conn = db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT reached_final FROM flow_users WHERE user_id=?",
-        (user_id,)
-    )
-    res = cursor.fetchone()
-    conn.close()
-    return bool(res and res[0] == 1)
-
-
-# ============================================================
-# GITHUB MEMBER BACKUP - MERGE, NEVER WIPE EXISTING MEMBERS
-# ============================================================
-def get_all_users():
-    conn = db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users ORDER BY user_id")
-    users = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return users
-
-
-def add_user(user_id):
-    conn = db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO users VALUES (?)",
-        (int(user_id),)
-    )
-    conn.commit()
-    conn.close()
-    sync_users_to_github()
-
-
-def github_configured():
-    return all([GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO])
-
-
-def load_users_from_github():
-    """Load members.json and MERGE its members into local DB."""
-    if not github_configured():
-        logger.warning("GitHub backup not configured.")
-        return set()
-
-    try:
-        url = (
-            f"https://api.github.com/repos/{GITHUB_OWNER}/"
-            f"{GITHUB_REPO}/contents/{GITHUB_FILE}"
-        )
-        headers = {
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json"
-        }
-
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code == 404:
-            logger.info("members.json does not exist yet.")
-            return set()
-
-        r.raise_for_status()
-
-        data = r.json()
-        raw = base64.b64decode(data["content"]).decode("utf-8")
-        members = json.loads(raw)
-
-        if not isinstance(members, list):
-            logger.warning("members.json is not a list; ignoring it.")
-            return set()
-
-        members = {int(x) for x in members}
-
-        conn = db()
-        cursor = conn.cursor()
-        for uid in members:
-            cursor.execute(
-                "INSERT OR IGNORE INTO users VALUES (?)",
-                (uid,)
-            )
-        conn.commit()
-        conn.close()
-
-        logger.info("Restored %s members from GitHub.", len(members))
-        return members
-
-    except Exception as e:
-        logger.error("GitHub Load Error: %s", e)
-        return set()
-
-
-def sync_users_to_github():
-    """
-    Merge local DB + existing members.json and write the UNION.
-    This prevents a redeploy with an empty/new DB from deleting old members.
-    """
-    if not github_configured():
-        return
-
-    try:
-        url = (
-            f"https://api.github.com/repos/{GITHUB_OWNER}/"
-            f"{GITHUB_REPO}/contents/{GITHUB_FILE}"
-        )
-        headers = {
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json"
-        }
-
-        existing_members = set()
-        sha = None
-
-        r = requests.get(url, headers=headers, timeout=15)
-
-        if r.status_code == 200:
-            data = r.json()
-            sha = data.get("sha")
-            try:
-                raw = base64.b64decode(data["content"]).decode("utf-8")
-                parsed = json.loads(raw)
-                if isinstance(parsed, list):
-                    existing_members = {int(x) for x in parsed}
-            except Exception:
-                logger.warning("Could not parse existing members.json.")
-        elif r.status_code != 404:
-            logger.error("GitHub GET failed: %s", r.text)
-            return
-
-        local_members = set(get_all_users())
-        merged = sorted(existing_members | local_members)
-
-        # Also keep local DB aligned with the merged backup.
-        conn = db()
-        cursor = conn.cursor()
-        for uid in merged:
-            cursor.execute(
-                "INSERT OR IGNORE INTO users VALUES (?)",
-                (uid,)
-            )
-        conn.commit()
-        conn.close()
-
-        content = json.dumps(merged, indent=2)
-        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-
-        payload = {
-            "message": "Update members.json",
-            "content": encoded
-        }
-        if sha:
-            payload["sha"] = sha
-
-        response = requests.put(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=20
-        )
-
-        if response.status_code not in (200, 201):
-            logger.error("GitHub Sync Failed: %s", response.text)
-        else:
-            logger.info("GitHub members synced: %s members.", len(merged))
-
-    except Exception as e:
-        logger.error("GitHub Sync Error: %s", e)
-
-
-# ============================================================
-# SAVED MESSAGE / FLOW HELPERS
-# ============================================================
+# ================= ORIGINAL REQUEST/JOIN-REQUEST MESSAGE FUNCTIONS =================
 def add_saved_message(chat_id, msg_id):
     global CACHED_MESSAGES
-
-    conn = db()
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO messages_list(chat_id, msg_id) VALUES (?, ?)",
-        (str(chat_id), str(msg_id))
-    )
+    cursor.execute("INSERT INTO messages_list (chat_id, msg_id) VALUES (?, ?)", (str(chat_id), str(msg_id)))
     conn.commit()
-
-    cursor.execute(
-        "SELECT chat_id, msg_id FROM messages_list ORDER BY id ASC"
-    )
+    cursor.execute("SELECT chat_id, msg_id FROM messages_list ORDER BY id ASC")
     CACHED_MESSAGES = cursor.fetchall()
     conn.close()
 
 
 def clear_saved_messages():
     global CACHED_MESSAGES
-
-    conn = db()
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
     cursor.execute("DELETE FROM messages_list")
-    cursor.execute(
-        "INSERT OR REPLACE INTO flow_settings(key, value) "
-        "VALUES ('final_message_id', '')"
-    )
     conn.commit()
     CACHED_MESSAGES = []
     conn.close()
 
-
-def get_saved_messages_with_ids():
-    conn = db()
+# ================= NEW /START MESSAGE FUNCTIONS =================
+def add_start_message(chat_id, msg_id):
+    global START_MESSAGES
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, chat_id, msg_id FROM messages_list ORDER BY id ASC"
-    )
-    rows = cursor.fetchall()
+    cursor.execute("INSERT INTO start_messages_list (chat_id, msg_id) VALUES (?, ?)", (str(chat_id), str(msg_id)))
+    conn.commit()
+    cursor.execute("SELECT chat_id, msg_id FROM start_messages_list ORDER BY id ASC")
+    START_MESSAGES = cursor.fetchall()
     conn.close()
-    return rows
 
 
-async def send_sequence_messages_instant(bot, chat_id, mark_final=True):
-    rows = get_saved_messages_with_ids()
-    if not rows:
-        return
+def clear_start_messages():
+    global START_MESSAGES
+    conn = sqlite3.connect('janeman_pro.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM start_messages_list")
+    conn.commit()
+    START_MESSAGES = []
+    set_setting('start_final_id', '')
+    conn.close()
 
-    final_id = get_flow_setting("final_message_id")
 
-    for row_id, source_chat, source_msg in rows:
+def get_start_final_id():
+    return get_setting('start_final_id')
+
+
+def set_start_final_id(message_key):
+    set_setting('start_final_id', message_key)
+
+
+def mark_start_final_reached(user_id):
+    conn = sqlite3.connect('janeman_pro.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO start_flow_users (user_id, final_reached) VALUES (?, 1)", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def has_start_final_reached(user_id):
+    conn = sqlite3.connect('janeman_pro.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT final_reached FROM start_flow_users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row and row[0] == 1)
+
+
+def clear_start_final_for_user(user_id):
+    conn = sqlite3.connect('janeman_pro.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM start_flow_users WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# ================= APPROVAL MESSAGE / BUTTON SETTINGS =================
+def get_approval_button():
+    value = get_setting("approval_button")
+    return value if value and value != "OFF" else DEFAULT_APPROVAL_BUTTON
+
+
+def save_approval_message(chat_id, msg_id):
+    global APPROVAL_MESSAGE
+    conn = sqlite3.connect("janeman_pro.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO approval_message (id, chat_id, msg_id) VALUES (1, ?, ?)", (str(chat_id), str(msg_id)))
+    conn.commit()
+    APPROVAL_MESSAGE = (str(chat_id), str(msg_id))
+    conn.close()
+
+
+def clear_approval_message():
+    global APPROVAL_MESSAGE
+    conn = sqlite3.connect("janeman_pro.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM approval_message")
+    conn.commit()
+    APPROVAL_MESSAGE = None
+    conn.close()
+
+
+def get_approval_menu():
+    status = "Custom message saved" if APPROVAL_MESSAGE else "Default text"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📝 Message: {status}", callback_data="set_approval_message")],
+        [InlineKeyboardButton(f"🔘 Button: {get_approval_button()}", callback_data="set_approval_button")],
+        [InlineKeyboardButton("🗑️ Use Default Message", callback_data="clear_approval_message")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="start_settings")]
+    ])
+
+
+async def send_approval_message(bot, chat_id):
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(get_approval_button(), callback_data="approve_me")]])
+    if APPROVAL_MESSAGE:
         try:
             await bot.copy_message(
                 chat_id=chat_id,
-                from_chat_id=int(source_chat),
-                message_id=int(source_msg)
+                from_chat_id=int(APPROVAL_MESSAGE[0]),
+                message_id=int(APPROVAL_MESSAGE[1]),
+                reply_markup=keyboard
             )
-
-            if mark_final and final_id and str(row_id) == str(final_id):
-                mark_user_reached_final(chat_id)
-
+            return
         except Exception as e:
-            logger.error("Message delivery failed: %s", e)
+            logging.error(f"Custom approval message failed, using default: {e}")
+    await bot.send_message(chat_id=chat_id, text=DEFAULT_APPROVAL_TEXT, reply_markup=keyboard)
 
 
-# ============================================================
-# ADMIN NOTIFICATION + REPLY
-# ============================================================
-def admin_user_text(user):
-    username = f"@{user.username}" if user.username else "No username"
-    name = (user.full_name or "Unknown").replace("\n", " ")
-    return (
-        f"👤 User Reached Final Step\n\n"
-        f"Name: {name}\n"
-        f"Username: {username}\n"
-        f"UID: {user.id}\n\n"
-        f"Reply karne ke liye neeche button dabao."
-    )
-
-
-async def notify_admin_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or update.effective_user.id == ADMIN_ID:
-        return
-
-    user = update.effective_user
-
-    # Only forward after the user has reached the configured final message.
-    if not user_reached_final(user.id):
-        return
-
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=admin_user_text(user),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "↩️ Reply to User",
-                    callback_data=f"reply_user:{user.id}"
-                )]
-            ])
-        )
-
-        await context.bot.copy_message(
-            chat_id=ADMIN_ID,
-            from_chat_id=update.message.chat_id,
-            message_id=update.message.message_id
-        )
-
-    except Exception as e:
-        logger.error("Admin notification failed: %s", e)
-
-
-# ============================================================
-# ADMIN PANEL UI
-# ============================================================
-def get_main_menu():
-    stats = get_stats()
-    total_users = len(get_all_users())
-
-    keyboard = [
-        [InlineKeyboardButton(
-            f"📊 Total Requests: {stats.get('total_requests', 0)}",
-            callback_data="none"
-        )],
-        [InlineKeyboardButton(
-            f"✅ Auto-Approved: {stats.get('accepted', 0)}",
-            callback_data="none"
-        )],
-        [InlineKeyboardButton(
-            f"👥 Database Users: {total_users}",
-            callback_data="none"
-        )],
-        [
-            InlineKeyboardButton(
-                "⚙️ Welcome Settings",
-                callback_data="welcome_settings"
-            ),
-            InlineKeyboardButton(
-                "📣 Broadcast Tool",
-                callback_data="broadcast_tool"
-            )
-        ],
-        [InlineKeyboardButton(
-            "🔄 Refresh Panel",
-            callback_data="refresh_main"
-        )]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_welcome_menu():
-    auto_status = get_setting("auto_accept")
-    status_text = (
-        "🟢 ON (Auto Accept)"
-        if auto_status == "ON"
-        else "🔴 OFF (Manual/No Accept)"
-    )
-
-    rows = get_saved_messages_with_ids()
-    final_id = get_flow_setting("final_message_id")
-
-    keyboard = [
-        [InlineKeyboardButton(
-            f"Status: {status_text}",
-            callback_data="toggle_auto"
-        )],
-        [InlineKeyboardButton(
-            "➕ Add Message / Media",
-            callback_data="edit_welcome"
-        )],
-        [InlineKeyboardButton(
-            "🎯 Set Final Message",
-            callback_data="set_final_menu"
-        )],
-        [InlineKeyboardButton(
-            "🗑️ Clear All Saved",
-            callback_data="clear_welcome"
-        )],
-        [InlineKeyboardButton(
-            "👁️ Test Sequence Message",
-            callback_data="test_msg"
-        )],
-        [InlineKeyboardButton(
-            "⬅️ Back to Main Menu",
-            callback_data="refresh_main"
-        )]
-    ]
-
-    if rows:
-        keyboard.insert(
-            2,
-            [InlineKeyboardButton(
-                f"Final: #{final_id}" if final_id else "Final: Not Set",
-                callback_data="set_final_menu"
-            )]
-        )
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_final_menu():
-    rows = get_saved_messages_with_ids()
-    final_id = get_flow_setting("final_message_id")
-
-    keyboard = []
-
-    if rows:
-        for row_id, _, _ in rows:
-            mark = " ✅ FINAL" if str(row_id) == str(final_id) else ""
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"Message #{row_id}{mark}",
-                    callback_data=f"set_final:{row_id}"
-                )
-            ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "❌ Remove Final",
-            callback_data="remove_final"
-        )
-    ])
-    keyboard.append([
-        InlineKeyboardButton(
-            "⬅️ Back",
-            callback_data="welcome_settings"
-        )
-    ])
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-# ============================================================
-# STATS
-# ============================================================
+# --- STATS ---
 def get_stats():
-    conn = db()
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
     cursor.execute("SELECT key, count FROM stats")
     res = dict(cursor.fetchall())
@@ -615,323 +357,400 @@ def get_stats():
 
 
 def update_stat(key, amount=1):
-    conn = db()
+    conn = sqlite3.connect('janeman_pro.db')
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE stats SET count = count + ? WHERE key=?",
-        (amount, key)
-    )
+    cursor.execute("UPDATE stats SET count = count + ? WHERE key=?", (amount, key))
     conn.commit()
     conn.close()
 
+# --- UI & HANDLERS ---
+def get_main_menu():
+    stats = get_stats()
+    total_users = len(get_all_users())
+    keyboard = [
+        [InlineKeyboardButton(f"📊 Total Requests: {stats.get('total_requests', 0)}", callback_data="none")],
+        [InlineKeyboardButton(f"✅ Auto-Approved: {stats.get('accepted', 0)}", callback_data="none")],
+        [InlineKeyboardButton(f"👥 Database Users: {total_users}", callback_data="none")],
+        [InlineKeyboardButton("⚙️ Welcome Settings", callback_data="welcome_settings"), InlineKeyboardButton("📣 Broadcast Tool", callback_data="broadcast_tool")],
+        [InlineKeyboardButton("▶️ Start Message Settings", callback_data="start_settings")],
+        [InlineKeyboardButton("🔄 Sync Members", callback_data="sync_members")],
+        [InlineKeyboardButton("🔄 Refresh Panel", callback_data="refresh_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# ============================================================
-# /START
-# ============================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    add_user(user.id)
 
-    # Existing behavior preserved: approval button.
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "✅ APPROVE ME",
-            callback_data="approve_me"
-        )]
-    ])
+def get_welcome_menu():
+    # ORIGINAL menu/function - remains for JOIN REQUEST flow.
+    auto_status = get_setting("auto_accept")
+    status_emoji = "🟢 ON (Auto Accept)" if auto_status == "ON" else "🔴 OFF (Manual/No Accept)"
+    total_saved = len(CACHED_MESSAGES)
+    keyboard = [
+        [InlineKeyboardButton(f"Status: {status_emoji}", callback_data="toggle_auto")],
+        [InlineKeyboardButton(f"➕ Add Message / Media", callback_data="edit_welcome")],
+        [InlineKeyboardButton(f"🗑️ Clear All Saved ({total_saved})", callback_data="clear_welcome")],
+        [InlineKeyboardButton("👁️ Test Sequence Message", callback_data="test_msg")],
+        [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="refresh_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
-        "VIP ME APPROVAL KLIYE NEECHE BUTTON PE TAP KARE 👇👇👇👇",
-        reply_markup=keyboard
-    )
 
-    if user.id == ADMIN_ID:
+def get_start_menu():
+    final_id = get_start_final_id()
+    total_saved = len(START_MESSAGES)
+    final_text = f"FINAL: #{final_id}" if final_id else "FINAL: Not Set"
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Start Message / Media", callback_data="add_start")],
+        [InlineKeyboardButton(f"🗑️ Clear Start Saved ({total_saved})", callback_data="clear_start")],
+        [InlineKeyboardButton("🎯 Set Final Message", callback_data="set_start_final")],
+        [InlineKeyboardButton(final_text, callback_data="start_final_info")],
+        [InlineKeyboardButton("👁️ Test Start Sequence", callback_data="test_start")],
+        [InlineKeyboardButton("✏️ Approval Message / Button", callback_data="approval_settings")],
+        [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="refresh_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_sequence_messages_instant(bot, chat_id):
+    # ORIGINAL request/join-request sequence ONLY.
+    if not CACHED_MESSAGES:
+        return
+    for row in CACHED_MESSAGES:
+        try:
+            await bot.copy_message(chat_id=chat_id, from_chat_id=int(row[0]), message_id=int(row[1]))
+        except Exception as e:
+            logging.error(f"Fast Delivery skipped: {e}")
+
+
+async def send_start_sequence(bot, chat_id, user_id=None):
+    # NEW /start sequence ONLY. If FINAL is set, delivery stops exactly at FINAL.
+    if not START_MESSAGES:
+        return False
+
+    final_id = str(get_start_final_id() or "")
+    reached_final = False
+
+    for index, row in enumerate(START_MESSAGES, start=1):
+        try:
+            await bot.copy_message(chat_id=chat_id, from_chat_id=int(row[0]), message_id=int(row[1]))
+        except Exception as e:
+            logging.error(f"Start Delivery skipped: {e}")
+            continue
+
+        if final_id and str(index) == final_id:
+            reached_final = True
+            break
+
+    if reached_final and user_id is not None:
+        mark_start_final_reached(user_id)
+    return reached_final
+
+
+async def start(update, context):
+    user_id = update.effective_user.id
+    add_user(user_id)
+
+    # /start flow: ONLY Start Message Settings are delivered here.
+    # Welcome Settings messages are NEVER delivered by /start.
+    clear_start_final_for_user(user_id)
+    await send_start_sequence(context.bot, user_id, user_id)
+
+    # Approval message/button is a separate editable setting.
+    await send_approval_message(context.bot, user_id)
+
+    if user_id == ADMIN_ID:
         await update.message.reply_text(
-            "👑 JANEMAN BOT V20 👑",
-            reply_markup=get_main_menu()
+            "👑 **JANEMAN BOT V20** 👑",
+            reply_markup=get_main_menu(),
+            parse_mode="Markdown"
         )
 
 
-# ============================================================
-# CALLBACKS
-# ============================================================
-async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callbacks(update, context):
     query = update.callback_query
-    await query.answer()
 
-    # User-facing approve button.
+    # Original behavior: admin panel callbacks are admin-only, except the user-facing approve button.
     if query.data == "approve_me":
-        await query.answer(
-            "✅ Approval request received!",
-            show_alert=True
-        )
+        await query.answer("✅ Approval request received!", show_alert=True)
         return
 
-    # Everything below is admin-only.
     if query.from_user.id != ADMIN_ID:
         return
+
+    await query.answer()
 
     if query.data == "none":
         return
 
+    if query.data == "sync_members":
+        ok = sync_users_to_github()
+        await query.answer("✅ Members synced to GitHub" if ok else "❌ GitHub sync failed", show_alert=True)
+        return
+
     if query.data == "refresh_main":
-        await query.edit_message_text(
-            "👑 JANEMAN BOT V20 👑",
-            reply_markup=get_main_menu()
-        )
+        await query.edit_message_text("👑 **JANEMAN BOT V20** 👑", reply_markup=get_main_menu(), parse_mode="Markdown")
 
     elif query.data == "welcome_settings":
-        await query.edit_message_text(
-            "⚙️ Settings",
-            reply_markup=get_welcome_menu()
-        )
+        await query.edit_message_text("⚙️ **Welcome Settings (Join Request)**", reply_markup=get_welcome_menu(), parse_mode="Markdown")
 
     elif query.data == "toggle_auto":
-        new_status = (
-            "OFF"
-            if get_setting("auto_accept") == "ON"
-            else "ON"
-        )
+        new_status = "OFF" if get_setting("auto_accept") == "ON" else "ON"
         set_setting("auto_accept", new_status)
-
-        await query.edit_message_text(
-            f"⚙️ Status: {new_status}",
-            reply_markup=get_welcome_menu()
-        )
+        await query.edit_message_text(f"⚙️ Status: {new_status}", reply_markup=get_welcome_menu(), parse_mode="Markdown")
 
     elif query.data == "edit_welcome":
-        context.user_data["state"] = "waiting_welcome"
-        await query.edit_message_text(
-            "📝 Ab message / photo / video / voice / media bhejo.\n"
-            "Har baar bheja hua item sequence mein save hoga.\n\n"
-            "Message save hone ke baad dobara Add Message dabao."
-        )
-
-    elif query.data == "set_final_menu":
-        rows = get_saved_messages_with_ids()
-        if not rows:
-            await query.edit_message_text(
-                "❌ Pehle kam se kam ek message/media save karo.",
-                reply_markup=get_welcome_menu()
-            )
-            return
-
-        await query.edit_message_text(
-            "🎯 Kaunsa saved message FINAL hoga?\n"
-            "Us final message ke baad user ka next message UID ke saath admin ko milega.",
-            reply_markup=get_final_menu()
-        )
-
-    elif query.data.startswith("set_final:"):
-        row_id = query.data.split(":", 1)[1]
-        set_flow_setting("final_message_id", row_id)
-
-        await query.edit_message_text(
-            f"✅ Message #{row_id} FINAL set ho gaya.\n\n"
-            "Final message tak pahunchne ke baad user ka next message "
-            "admin ko UID ke saath forward hoga.",
-            reply_markup=get_welcome_menu()
-        )
-
-    elif query.data == "remove_final":
-        set_flow_setting("final_message_id", "")
-        await query.edit_message_text(
-            "❌ Final message remove kar diya.",
-            reply_markup=get_welcome_menu()
-        )
+        context.user_data['state'] = 'waiting_welcome'
+        await query.edit_message_text("📝 **Join Request ke liye Message / Media bhejein...**")
 
     elif query.data == "clear_welcome":
         clear_saved_messages()
-        await query.edit_message_text(
-            "🗑️ Cleared!",
-            reply_markup=get_welcome_menu()
-        )
-
-    elif query.data == "broadcast_tool":
-        context.user_data["state"] = "waiting_broadcast"
-        await query.edit_message_text(
-            "📣 Post bhejo broadcast ke liye:"
-        )
+        await query.edit_message_text("🗑️ Cleared!", reply_markup=get_welcome_menu(), parse_mode="Markdown")
 
     elif query.data == "test_msg":
-        await send_sequence_messages_instant(
-            context.bot,
-            ADMIN_ID,
-            mark_final=False
+        await send_sequence_messages_instant(context.bot, ADMIN_ID)
+
+    elif query.data == "broadcast_tool":
+        context.user_data['state'] = 'waiting_broadcast'
+        await query.edit_message_text("📣 **Post bhejein broadcast ke liye:**")
+
+    # NEW /START SETTINGS
+    elif query.data == "start_settings":
+        await query.edit_message_text("▶️ **Start Message Settings**\n\nYe messages sirf /start dabane par jayenge.\nWelcome Settings wale messages join request par hi jayenge.", reply_markup=get_start_menu(), parse_mode="Markdown")
+
+    elif query.data == "add_start":
+        context.user_data['state'] = 'waiting_start'
+        await query.edit_message_text("📝 **/start ke liye Message / Media bhejein...**")
+
+    elif query.data == "clear_start":
+        clear_start_messages()
+        await query.edit_message_text("🗑️ Start messages cleared!", reply_markup=get_start_menu(), parse_mode="Markdown")
+
+    elif query.data == "set_start_final":
+        if not START_MESSAGES:
+            await query.edit_message_text("❌ Pehle Start Message / Media add karo.", reply_markup=get_start_menu(), parse_mode="Markdown")
+        else:
+            context.user_data['state'] = 'waiting_start_final'
+            await query.edit_message_text(
+                "🎯 **Final message set karo**\n\n" +
+                "Apne saved Start messages me se jis number ko FINAL banana hai, sirf number bhejo.\n\n" +
+                "Example: `3`",
+                parse_mode="Markdown"
+            )
+
+    elif query.data == "start_final_info":
+        final_id = get_start_final_id()
+        await query.answer(f"FINAL = {final_id or 'Not Set'}", show_alert=True)
+
+    elif query.data == "test_start":
+        await send_start_sequence(context.bot, ADMIN_ID, None)
+        await send_approval_message(context.bot, ADMIN_ID)
+
+    elif query.data == "approval_settings":
+        await query.edit_message_text(
+            "✏️ **Approval Message / Button Settings**\n\n"
+            "Ye /start flow ke end me aane wala approval message hai.\n"
+            "Welcome Settings ka Join Request message isse alag hai.",
+            reply_markup=get_approval_menu(), parse_mode="Markdown"
         )
 
-    elif query.data.startswith("reply_user:"):
-        target_uid = query.data.split(":", 1)[1]
+    elif query.data == "set_approval_message":
+        context.user_data['state'] = 'waiting_approval_message'
+        await query.edit_message_text("📝 **Approval ke liye koi bhi message/media bhejo.**\n\nYe /start ke baad APPROVE button ke saath send hoga.")
 
-        context.user_data["reply_to_uid"] = int(target_uid)
-        context.user_data["state"] = "waiting_admin_reply"
+    elif query.data == "set_approval_button":
+        context.user_data['state'] = 'waiting_approval_button'
+        await query.edit_message_text(f"🔘 **Naya button text bhejo.**\n\nCurrent: `{get_approval_button()}`", parse_mode="Markdown")
 
-        await query.message.reply_text(
-            f"✍️ UID {target_uid} ko reply bhejo.\n"
-            f"Text, photo, video, voice ya media bhej sakte ho.\n"
-            f"Cancel ke liye /cancel_reply"
-        )
+    elif query.data == "clear_approval_message":
+        clear_approval_message()
+        await query.edit_message_text("✅ Default approval message restore ho gaya.", reply_markup=get_approval_menu(), parse_mode="Markdown")
+
+    elif query.data == "start_final_info":
+        await query.answer(f"FINAL = {get_start_final_id() or 'Not Set'}", show_alert=True)
 
 
-# ============================================================
-# ADMIN CONTENT HANDLER
-# ============================================================
-async def content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
+async def content_handler(update, context):
     user_id = update.effective_user.id
 
-    # Admin actions.
+    # ================= NEW: ADMIN REPLY TO A USER =================
     if user_id == ADMIN_ID:
-        state = context.user_data.get("state")
-
-        if state == "waiting_welcome":
-            add_saved_message(
-                update.message.chat_id,
-                update.message.message_id
-            )
-            await update.message.reply_text(
-                "✅ Message/media saved.\n"
-                "Agar ye FINAL hai to Welcome Settings → Set Final Message se select karo."
-            )
-            context.user_data["state"] = None
-            return
-
-        if state == "waiting_broadcast":
-            context.user_data["state"] = None
-            users = get_all_users()
-            sent = 0
-
-            for uid in users:
-                try:
-                    await context.bot.copy_message(
-                        chat_id=uid,
-                        from_chat_id=update.message.chat_id,
-                        message_id=update.message.message_id
-                    )
-                    sent += 1
-                except Exception:
-                    pass
-
-            await update.message.reply_text(
-                f"🏁 Broadcast Done!\nSent: {sent}/{len(users)}"
-            )
-            return
-
-        if state == "waiting_admin_reply":
-            target_uid = context.user_data.get("reply_to_uid")
-
-            if not target_uid:
-                context.user_data["state"] = None
-                await update.message.reply_text("❌ Reply target missing.")
-                return
-
+        reply_to_user = context.user_data.get('reply_to_user')
+        if reply_to_user:
             try:
                 await context.bot.copy_message(
-                    chat_id=int(target_uid),
+                    chat_id=int(reply_to_user),
                     from_chat_id=update.message.chat_id,
                     message_id=update.message.message_id
                 )
-                await update.message.reply_text(
-                    f"✅ Reply sent to UID {target_uid}."
-                )
+                context.user_data['reply_to_user'] = None
+                await update.message.reply_text(f"✅ Reply sent to UID: {reply_to_user}")
             except Exception as e:
-                await update.message.reply_text(
-                    f"❌ Reply send failed: {e}"
-                )
+                logging.error(f"Admin Reply Error: {e}")
+                await update.message.reply_text("❌ Reply send nahi hua. User ne bot block kiya ho sakta hai.")
+            return
 
-            context.user_data["state"] = None
-            context.user_data["reply_to_uid"] = None
+        state = context.user_data.get('state')
+
+        # ORIGINAL welcome/request message saving.
+        if state == 'waiting_welcome':
+            add_saved_message(update.message.chat_id, update.message.message_id)
+            await update.message.reply_text("✅ Cached for JOIN REQUEST!")
+            return
+
+        # NEW start message saving.
+        if state == 'waiting_start':
+            add_start_message(update.message.chat_id, update.message.message_id)
+            await update.message.reply_text(f"✅ Start message #{len(START_MESSAGES)} saved!")
+            return
+
+        # NEW final message selection.
+        if state == 'waiting_start_final':
+            text = (update.message.text or '').strip()
+            if not text.isdigit():
+                await update.message.reply_text("❌ Sirf number bhejo. Example: 3")
+                return
+            number = int(text)
+            if number < 1 or number > len(START_MESSAGES):
+                await update.message.reply_text(f"❌ Number 1 se {len(START_MESSAGES)} ke beech hona chahiye.")
+                return
+            set_start_final_id(str(number))
+            context.user_data['state'] = None
+            await update.message.reply_text(f"🎯 Start message #{number} FINAL set ho gaya.", reply_markup=get_start_menu())
+            return
+
+        # NEW approval message saving.
+        if state == 'waiting_approval_message':
+            save_approval_message(update.message.chat_id, update.message.message_id)
+            context.user_data['state'] = None
+            await update.message.reply_text("✅ Approval message/media saved! Ab /start par ye APPROVE button ke saath jayega.", reply_markup=get_approval_menu())
+            return
+
+        if state == 'waiting_approval_button':
+            text = (update.message.text or '').strip()
+            if not text:
+                await update.message.reply_text("❌ Button ka text plain text me bhejo.")
+                return
+            if len(text) > 50:
+                await update.message.reply_text("❌ Button text 50 characters se chhota rakho.")
+                return
+            set_setting('approval_button', text)
+            context.user_data['state'] = None
+            await update.message.reply_text("✅ Approval button text updated!", reply_markup=get_approval_menu())
+            return
+
+        # ORIGINAL broadcast behavior.
+        if state == 'waiting_broadcast':
+            context.user_data['state'] = None
+            users = get_all_users()
+            for u_id in users:
+                try:
+                    await context.bot.copy_message(chat_id=u_id, from_chat_id=update.message.chat_id, message_id=update.message.message_id)
+                except Exception:
+                    pass
+            await update.message.reply_text("🏁 Broadcast Done!")
             return
 
         return
 
-    # User message after final step.
-    if user_reached_final(user_id):
-        await notify_admin_user_message(update, context)
+    # ================= NEW: USER MESSAGE AFTER /start FINAL =================
+    if has_start_final_reached(user_id):
+        try:
+            username = update.effective_user.username
+            name = update.effective_user.full_name or "Unknown"
+            header = (
+                "📩 **New User Message After FINAL**\n\n"
+                f"👤 Name: {name}\n"
+                f"🆔 UID: `{user_id}`\n"
+                f"🔗 Username: @{username}" if username else
+                "📩 **New User Message After FINAL**\n\n"
+                f"👤 Name: {name}\n"
+                f"🆔 UID: `{user_id}`\n"
+                "🔗 Username: Not set"
+            )
+            reply_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Reply to User", callback_data=f"reply_user:{user_id}")]
+            ])
+            await context.bot.send_message(ADMIN_ID, header, parse_mode="Markdown", reply_markup=reply_keyboard)
+            await context.bot.copy_message(
+                chat_id=ADMIN_ID,
+                from_chat_id=update.message.chat_id,
+                message_id=update.message.message_id
+            )
+        except Exception as e:
+            logging.error(f"Forward User Message Error: {e}")
 
 
-# ============================================================
-# ADMIN CANCEL REPLY
-# ============================================================
-async def cancel_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_reply_user(update, context):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        return
+    if not query.data.startswith("reply_user:"):
+        return
+    try:
+        user_id = int(query.data.split(":", 1)[1])
+    except Exception:
+        await query.answer("Invalid user", show_alert=True)
+        return
+    context.user_data['reply_to_user'] = user_id
+    context.user_data['state'] = None
+    await query.answer()
+    await query.message.reply_text(f"✍️ UID `{user_id}` ko reply bhejo. /cancel_reply se cancel kar sakte ho.", parse_mode="Markdown")
+
+
+async def sync_members_command(update, context):
     if update.effective_user.id != ADMIN_ID:
         return
+    ok = sync_users_to_github()
+    total = len(get_all_users())
+    await update.message.reply_text(
+        f"{'✅' if ok else '❌'} GitHub members sync {'successful' if ok else 'failed'}.\nLocal DB members: {total}"
+    )
 
-    context.user_data["state"] = None
-    context.user_data["reply_to_uid"] = None
-    await update.message.reply_text("❌ Reply cancelled.")
+
+async def cancel_reply(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    context.user_data['reply_to_user'] = None
+    context.user_data['state'] = None
+    await update.message.reply_text("❌ Reply mode cancelled.")
 
 
-# ============================================================
-# JOIN REQUEST
-# ============================================================
-async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def join_request_handler(update, context):
     request = update.chat_join_request
     if not request:
         return
 
-    uid = request.from_user.id
+    # ORIGINAL JOIN REQUEST flow ONLY.
+    update_stat('total_requests', 1)
+    add_user(request.from_user.id)
 
-    update_stat("total_requests", 1)
-    add_user(uid)
-
-    await send_sequence_messages_instant(
-        context.bot,
-        uid,
-        mark_final=True
-    )
+    # IMPORTANT: /start messages are NOT sent here.
+    await send_sequence_messages_instant(context.bot, request.from_user.id)
 
     if get_setting("auto_accept") == "ON":
-        try:
-            await context.bot.approve_chat_join_request(
-                chat_id=request.chat.id,
-                user_id=uid
-            )
-            update_stat("accepted", 1)
-        except Exception as e:
-            logger.error("Auto-approve failed: %s", e)
+        await context.bot.approve_chat_join_request(chat_id=request.chat.id, user_id=request.from_user.id)
+        update_stat('accepted', 1)
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     init_db()
-
-    # FIRST restore GitHub members into the DB.
-    # Then sync the UNION back to GitHub.
     load_users_from_github()
     sync_users_to_github()
 
-    threading.Thread(
-        target=run_health_server,
-        daemon=True
-    ).start()
-
-    if os.environ.get("RENDER_EXTERNAL_URL"):
-        threading.Thread(
-            target=self_ping_loop,
-            daemon=True
-        ).start()
+    threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=self_ping_loop, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel_reply", cancel_reply))
+    app.add_handler(CommandHandler("sync_members", sync_members_command))
+    app.add_handler(CallbackQueryHandler(callback_reply_user, pattern=r"^reply_user:"))
     app.add_handler(CallbackQueryHandler(handle_callbacks))
     app.add_handler(ChatJoinRequestHandler(join_request_handler))
-    app.add_handler(
-        MessageHandler(
-            filters.ALL & ~filters.COMMAND,
-            content_handler
-        )
-    )
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, content_handler))
 
-    print("🟢 VIP BOT ONLINE 🟢")
+    print("\n🟢 VIP HYPER-SPEED 24/7 ENGINE ONLINE 🟢\n")
     app.run_polling()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
