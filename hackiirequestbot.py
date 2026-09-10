@@ -42,8 +42,8 @@ CACHED_MESSAGES = []
 START_MESSAGES = []
 APPROVAL_MESSAGE = None  # (chat_id, msg_id)
 
-DEFAULT_APPROVAL_TEXT = "VIP ME APPROVAL KLIYE NEECHE BUTTON PE TAP KARE 👇👇👇👇"
-DEFAULT_APPROVAL_BUTTON = "✅ APPROVE ME"
+DEFAULT_APPROVAL_TEXT = "𝗡𝗨𝗠𝗕𝗘𝗥 𝗕𝗘𝗧 𝗖𝗛𝗔𝗛𝗜𝗬𝗘 𝟭"
+DEFAULT_APPROVAL_BUTTON = "𝘾𝙡𝙞𝙘𝙠 𝙔𝙚𝙨♥️"
 GITHUB_SYNC_LOCK = threading.Lock()
 
 # --- WEB SERVER & ANTI-SLEEP ---
@@ -531,7 +531,7 @@ async def handle_callbacks(update, context):
 
     # Original behavior: admin panel callbacks are admin-only, except the user-facing approve button.
     if query.data == "approve_me":
-        await query.answer("✅ Approval request received!", show_alert=True)
+        await query.answer("𝟮 𝗠𝗶𝗻𝘂𝘁 𝗗𝗲𝘁𝗮 𝗵𝘂💯", show_alert=True)
         return
 
     if query.from_user.id != ADMIN_ID:
